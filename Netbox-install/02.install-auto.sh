@@ -138,6 +138,8 @@ function configure-netbox {
     sed -i "s/'USER': ''/'USER': '$POSTGRES_USERNAME'/g" configuration.py
     sed -i "0,/'PASSWORD': ''/s/'PASSWORD': ''/'PASSWORD': '$POSTGRES_PASSWORD'/g" configuration.py
     sed -i "s/SECRET_KEY = ''/SECRET_KEY = '$Secret_key'/g" configuration.py
+    sed -i "s/TIME_ZONE = 'UTC'/TIME_ZONE = 'Asia\/Ho_Chi_Minh'/g" configuration.py
+
     /opt/netbox/upgrade.sh
     source /opt/netbox/venv/bin/activate
     cd /opt/netbox/netbox
