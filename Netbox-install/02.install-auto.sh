@@ -14,7 +14,9 @@ read -sp "Enter the Netbox useradmin password: " NETBOX_PASSWORD
 echo ""
 
 IP=$(hostname -I | awk '{print $1}')
-read -p "Enter the Domain Netbox: " Domain_Netbox
+read -p "Enter the Domain Netbox : " Domain_Netbox
+echo ""
+read -p "Use Let's Encrypt (certbot) for SSL? (y/n): " USE_CERTBOT
 echo ""
 ALLOWED_HOSTS="'$IP','$Domain_Netbox'"
 
@@ -106,11 +108,12 @@ function install-netbox {
     if [ ! -d "/opt/netbox" ]; then
         # Download and install Netbox
         sudo wget https://github.com/netbox-community/netbox/archive/refs/tags/$(curl -s https://api.github.com/repos/netbox-community/netbox/releases/latest | grep 'tag_name' | cut -d\" -f4).tar.gz -P /tmp
-		sudo mkdir -p /opt/netbox
+        sudo mkdir -p /opt/netbox
         sudo tar -xzf /tmp/$(curl -s https://api.github.com/repos/netbox-community/netbox/releases/latest | grep 'tag_name' | cut -d\" -f4).tar.gz -C /opt/netbox --strip-components=1
 
         sudo adduser --system --group netbox
         
+        mkdir -p /opt/netbox/netbox/media/
         sudo chown --recursive netbox /opt/netbox/netbox/media/
         sudo chown --recursive netbox /opt/netbox/netbox/reports/
         sudo chown --recursive netbox /opt/netbox/netbox/scripts/
@@ -129,10 +132,43 @@ function install-netbox {
 
 # Function to configure Netbox
 function configure-netbox {
-    # Generate secret key
-    Secret_key=$(python3 /opt/netbox/netbox/generate_secret_key.py)
     cd /opt/netbox/netbox/netbox
     cp configuration_example.py configuration.py
+    # Generate secret key
+    Secret_key=$(python3 /opt/netbox/netbox/generate_secret_key.py)
+    CONF="/opt/netbox/netbox/netbox/configuration.py"
+
+# Safety check
+if [ ! -f "$CONF" ]; then
+  echo "ERROR: configuration.py not found at $CONF" >&2
+  exit 1
+fi
+
+# Generate API token pepper
+API_PEPPER_RAW=$(python3 /opt/netbox/netbox/generate_secret_key.py)
+
+# Convert to safe Python literal (JSON string)
+PEPPER_LITERAL=$(python3 - <<EOF
+import json
+print(json.dumps("$API_PEPPER_RAW"))
+EOF
+)
+
+# Remove single-line empty definition: API_TOKEN_PEPPERS = {}
+sed -i "/^API_TOKEN_PEPPERS\s*=\s*{}$/d" "$CONF"
+
+# Remove multi-line definition if exists
+sed -i "/^API_TOKEN_PEPPERS\s*=\s*{/,/^}/d" "$CONF"
+
+# Append correct definition
+cat >> "$CONF" <<EOF
+
+# Define cryptographic peppers for API tokens
+API_TOKEN_PEPPERS = {
+    1: $PEPPER_LITERAL,
+}
+EOF
+
     # Replace content in the configuration file
     sed -i "s/^ALLOWED_HOSTS = \[\]$/ALLOWED_HOSTS = [$ALLOWED_HOSTS]/g" configuration.py
     sed -i "s/'USER': ''/'USER': '$POSTGRES_USERNAME'/g" configuration.py
@@ -158,50 +194,111 @@ function configure-netbox {
     systemctl enable netbox netbox-rq
 }
 
-# Function to install Nginx
+# Function to install Nginx (supports certbot if requested)
 function install-nginx {
     # Install Nginx
     sudo apt install -y nginx
     cd ~
+
+    # Ensure UFW allows HTTP/HTTPS (configure-ufw already called but ensure here)
+    sudo ufw allow 80/tcp
+    sudo ufw allow 443/tcp
+
+    if [[ "$USE_CERTBOT" =~ ^[Yy]$ && -n "$Domain_Netbox" ]]; then
+        echo "Configuring Nginx for certbot (Let's Encrypt) for domain: $Domain_Netbox"
+
+        # Create a basic HTTP serverblock so certbot can perform HTTP-01 challenge
+        sudo tee /etc/nginx/sites-available/netbox.conf > /dev/null <<EOF
+server {
+    listen 80;
+    server_name $Domain_Netbox;
+
+    client_max_body_size 25m;
+
+    location /static/ {
+        alias /opt/netbox/netbox/static/;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+    }
+}
+EOF
+        rm -f /etc/nginx/sites-enabled/default
+        ln -sf /etc/nginx/sites-available/netbox.conf /etc/nginx/sites-enabled/netbox.conf
+        sudo mkdir -p /var/www/html
+        sudo chown -R www-data:www-data /var/www/html
+        sudo systemctl restart nginx
+
+        # Install certbot and nginx plugin
+        sudo apt update
+        sudo apt install -y certbot python3-certbot-nginx
+
+        # Obtain/renew certificate and let certbot edit nginx conf and enable HTTPS + redirect
+        if sudo certbot --nginx -d "$Domain_Netbox" --non-interactive --agree-tos -m "$NETBOX_MAIL" --redirect; then
+            echo "Certbot obtained certificate and configured Nginx."
+            sudo systemctl reload nginx
+            cd ~
+            return
+        else
+            echo "Certbot failed or domain not reachable for HTTP challenge. Falling back to self-signed certificate."
+        fi
+    else
+        if [[ "$USE_CERTBOT" =~ ^[Yy]$ && -z "$Domain_Netbox" ]]; then
+            echo "Let's Encrypt requested but no Domain_Netbox provided. Will use self-signed certificate."
+        else
+            echo "Using self-signed certificate for Nginx."
+        fi
+    fi
+
+    # Self-signed certificate generation (fallback)
     openssl genrsa -out CA.key 2048
-    openssl req -x509 -sha256 -new -nodes -days 3650 -key CA.key -out CA.pem
+    openssl req -x509 -sha256 -new -nodes -days 3650 -key CA.key -out CA.pem -subj "/CN=Local CA"
     openssl genrsa -out localhost.key 2048
-    openssl req -new -key localhost.key -out localhost.csr
+    openssl req -new -key localhost.key -out localhost.csr -subj "/CN=${Domain_Netbox:-localhost}"
     sudo tee localhost.ext > /dev/null <<EOF
 authorityKeyIdentifier = keyid,issuer
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
 subjectAltName = @alt_names
 [alt_names]
-DNS.1 = $Domain_Netbox
+DNS.1 = ${Domain_Netbox:-localhost}
 IP.1 = $IP
 EOF
     openssl x509 -req -in localhost.csr -CA CA.pem -CAkey CA.key -CAcreateserial -days 365 -sha256 -extfile localhost.ext -out localhost.crt
-    mkdir /etc/nginx/ssl-certificate
-    mv localhost.crt localhost.key /etc/nginx/ssl-certificate
+    sudo mkdir -p /etc/nginx/ssl-certificate
+    sudo mv localhost.crt localhost.key /etc/nginx/ssl-certificate
+
     # Edit Nginx main configuration file
     sudo sed -i '/http {/a \ \ server_names_hash_bucket_size 64;' /etc/nginx/nginx.conf
 
-    # Create virtual host configuration file for Netbox
+    # Create virtual host configuration file for Netbox (self-signed)
     sudo tee /etc/nginx/sites-available/netbox.conf > /dev/null <<EOF
 server {
         listen 80;
         server_name $IP,$Domain_Netbox;
         return 301 https://\$host\$request_uri;
-}	
-	
+}   
+
 server {
     listen 443 ssl;
     server_name $IP,$Domain_Netbox;
 
     client_max_body_size 25m;
-	# SSL Configuration
+    # SSL Configuration
     ssl_certificate     /etc/nginx/ssl-certificate/localhost.crt;
     ssl_certificate_key /etc/nginx/ssl-certificate/localhost.key;
-	# Log
-	access_log /var/log/nginx/netbox.access.log;
+    # Log
+    access_log /var/log/nginx/netbox.access.log;
     error_log /var/log/nginx/netbox.error.log;
-	
+    
     location /static/ {
         alias /opt/netbox/netbox/static/;
     }
@@ -212,12 +309,12 @@ server {
         proxy_set_header X-Forwarded-Host \$http_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
-	}
+    }
 }
 EOF
-    # Áp dụng cấu hình
+    # Apply configuration
     rm -rf /etc/nginx/sites-enabled/default
-    ln -s /etc/nginx/sites-available/netbox.conf /etc/nginx/sites-enabled/netbox.conf
+    ln -sf /etc/nginx/sites-available/netbox.conf /etc/nginx/sites-enabled/netbox.conf
     # Restart Nginx service to apply changes
     sudo systemctl start nginx
     sudo systemctl restart nginx
@@ -235,4 +332,3 @@ install-python
 install-netbox
 configure-netbox
 install-nginx
-
